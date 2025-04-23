@@ -1,0 +1,156 @@
+mport os
+import aiohttp
+import json
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import Commitment
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.instruction import Instruction
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from anchorpy import Program, Provider, Wallet
+from base64 import b64encode
+import struct
+
+# Configuration
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  # Replace or use env variable
+RPC_ENDPOINT = os.getenv("RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")  # Replace with QuickNode/Helius RPC
+WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "YOUR_WALLET_PRIVATE_KEY")  # Replace or use env variable
+
+# Raydium AMM program ID
+RAYDIUM_AMM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+# WSOL mint address
+SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112")
+
+# Initialize Solana client and wallet
+solana_client = AsyncClient(RPC_ENDPOINT)
+wallet = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command."""
+    await update.message.reply_text(
+        "Welcome to the Raydium Buy Bot! Use /buy <token_address> <sol_amount> to buy tokens.\n"
+        "Example: /buy 2x8o3hA5S5fBxCSE9hzVTf3RohcMWHqkDNKNEPuzprD5 0.1"
+    )
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /buy command to execute a token purchase on Raydium."""
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Usage: /buy <token_address> <sol_amount>")
+        return
+
+    token_address = args[0]
+    try:
+        sol_amount = float(args[1])
+        if sol_amount <= 0:
+            raise ValueError("Amount must be positive")
+    except ValueError:
+        await update.message.reply_text("Invalid SOL amount. Use a number (e.g., 0.1).")
+        return
+
+    # Validate token address
+    try:
+        token_mint = Pubkey.from_string(token_address)
+    except Exception:
+        await update.message.reply_text("Invalid token address.")
+        return
+
+    await update.message.reply_text("Processing buy order...")
+
+    # Fetch pool info (simplified; assumes pool exists)
+    # In production, query Raydium API or chain for pool ID
+    async with aiohttp.ClientSession() as session:
+        # Example: Query Raydium API for pool info (replace with actual endpoint or on-chain query)
+        pool_info_url = "https://api.raydium.io/v2/amm/pools"
+        async with session.get(pool_info_url) as response:
+            if response.status != 200:
+                await update.message.reply_text("Failed to fetch Raydium pool info.")
+                return
+            pools = await response.json()
+            pool_data = None
+            for pool in pools["data"]:
+                if pool["baseMint"] == str(SOL_MINT) and pool["quoteMint"] == str(token_mint):
+                    pool_data = pool
+                    break
+                elif pool["quoteMint"] == str(SOL_MINT) and pool["baseMint"] == str(token_mint):
+                    pool_data = pool
+                    break
+            if not pool_data:
+                await update.message.reply_text("No Raydium pool found for this token.")
+                return
+
+    # Initialize Anchor provider
+    provider = Provider(solana_client, Wallet(wallet))
+    
+    # Construct swap instruction (simplified)
+    # Note: This is a basic example. Use Raydium SDK or anchorpy for proper IDL-based instructions
+    pool_id = Pubkey.from_string(pool_data["id"])
+    amount_in = int(sol_amount * 1_000_000_000)  # SOL in lamports
+    amount_out_min = 0  # Slippage control (set to 0 for simplicity; adjust for production)
+
+    # Accounts for swap instruction (replace with actual accounts from pool data)
+    accounts = {
+        "amm": pool_id,
+        "authority": Pubkey.from_string(pool_data["authority"]),
+        "user_transfer_authority": wallet.pubkey(),
+        "source": Pubkey.from_string(pool_data["baseVault"]),  # Adjust based on pool direction
+        "destination": Pubkey.from_string(pool_data["quoteVault"]),
+        "pool_coin_token_account": Pubkey.from_string(pool_data["baseVault"]),
+        "pool_pc_token_account": Pubkey.from_string(pool_data["quoteVault"]),
+        "spl_program": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+    }
+
+    # Build swap instruction (simplified; use Raydium IDL for precise instruction)
+    data = struct.pack("<BQQ", 9, amount_in, amount_out_min)  # 9 is swap instruction discriminator
+    instruction = Instruction(RAYDIUM_AMM_PROGRAM_ID, list(accounts.values()), data)
+
+    # Build transaction
+    recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+    message = MessageV0.compile(
+        payer=wallet.pubkey(),
+        instructions=[instruction],
+        recent_blockhash=recent_blockhash,
+    )
+    transaction = VersionedTransaction(message, [wallet])
+
+    # Send transaction
+    try:
+        tx_id = await solana_client.send_transaction(transaction, Commitment("confirmed"))
+        await update.message.reply_text(
+            f"Buy order executed! Tx: https://explorer.solana.com/tx/{tx_id.value}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Transaction failed: {str(e)}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command."""
+    await update.message.reply_text(
+        "Commands:\n/start - Start the bot\n/buy <token_address> <sol_amount> - Buy tokens\n/help - Show this message"
+    )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors."""
+    await update.message.reply_text("An error occurred. Please try again or contact support.")
+
+def main() -> None:
+    """Run the bot."""
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("buy", buy))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_error_handler(error_handler)
+
+    # Start polling
+    http://application.run_polling()
+
+if __name__ == "__main__":
+    main()
